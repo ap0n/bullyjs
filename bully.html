@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html><head>
+  <script src="http://ajax.googleapis.com/ajax/libs/jquery/1.6.2/jquery.min.js"></script>
+  <script src="https://www.dropbox.com/s/2sautef10on75wi/sockjs-0.3.js?dl=1"></script>
+  <script src="https://www.dropbox.com/s/6zrkjhr7gh5o86r/stomp.js?dl=1"></script>
+    <title>Bully Algorithm over Browsers</title>
+  <link href="https://www.dropbox.com/s/s5f3ht0ddunw1ld/style.css?dl=1" rel="stylesheet" type="text/css"/>
+</head>
+
+<body lang="en">
+
+  <h1>Bully Algorithm over Browser</h1>
+
+  <div class="box">
+    <input id="selfPid" placeholder="Set your selfPid" onkeypress="return catchReturnKey(event)" autofocus></input>
+    <input id="connectButton" type="button" value="connect" onclick="connect()"/>
+    <input id="disConnectButton" type="button" value="disconnect" onclick="disconnect()"></input>
+  </div>
+
+	<br/>
+
+  <div id="first" class="box">
+    <h2>Received</h2>
+    <div id="received"></div>
+  </div>
+
+	<br/>
+
+  <div id="second" class="box">
+    <h2>Logs</h2>
+    <div id="logs"></div>
+  </div>
+
+  <script type="text/javascript">
+
+    var selfPid = -1;
+    var maxPid = 10;  // todo: get this from the user. PIDs in [0, maxPid]
+    var leaderPid = -1;
+    var ackReceived = false;
+    var gotLeader = false;
+    var startedElection = false;
+    
+    var electionTimeout = 1000;  // timeout for election in ms
+    var electionTimer = null;
+    var leaderTimeout = 2000;  // timeout for leader response in ms
+    var leaderTimer = null;
+    var maxPingPongLag = 1000;  // time between two consequent ping messages in ms
+	
+    document.getElementById('disConnectButton').disabled = true;
+		
+    function connect() {
+
+      print('logs', 'Connecting...');
+      // var ws = new SockJS('http://127.0.0.1:15674/stomp');	// WebSocket initialization
+      var ws = new SockJS('http://147.27.14.117:15674/stomp'); // WebSocket initialization
+
+      client = Stomp.over(ws);  // STOMP client initialization
+      client.heartbeat.outgoing = 0;
+      client.heartbeat.incoming = 0;
+      client.connect('test', 'test', onConnect, onError, '/');
+    }
+	
+    function onConnect() {
+  		disconnected =false;
+  		if (inputCheck(document.getElementById('selfPid').value)) {
+  		  selfPid = Number(document.getElementById('selfPid').value);
+  		  document.getElementById('selfPid').disabled = true;
+  		  document.getElementById('connectButton').disabled = true;
+  		  document.getElementById('disConnectButton').disabled = false;
+
+  			print('logs', 'Connected. selfPid = ' + String(selfPid));
+  			topic = "/topic/" + String(selfPid);
+  			subscription = client.subscribe(topic, onMessage);  // onMessage: called every time the client receives a message
+  			startElection();
+  		} else {
+  			print('logs', 'Positive integer must be inserted as PID. Please try again.');
+  		}
+    }
+	
+    function startElection() {
+      print('logs', 'Starting new election');
+      gotLeader = false;
+      ackReceived = false;
+      startedElection = true;
+      
+  		if (selfPid == maxPid) {  // case the browser has the maximum pid 	TODO: Is it necessary??
+  			print('logs', 'I\'m the new leader!');
+  			notifyOthers(0, "LEADER");	// notify all
+  			return;
+  		}
+      notifyOthers(selfPid, "ELECTION");  // notify only browsers with PID > selfPid for ELECTION
+
+      electionTimer = setTimeout(onElectionTimeout, electionTimeout);
+    }
+	
+    function notifyOthers(firstPid, message) {
+      // sends message to every processes with PID in [firstPid, maxPid]
+      for (var i = firstPid; i <= maxPid; i++) {
+        if (i == selfPid) {	// don't send to himself
+          continue;
+        }
+        sendMessage(i, message)
+      }
+    }
+
+    function sendMessage(receiverPid, msgType) {
+
+      // Message format: {type: TYPE, sender: senderPid}
+      // legal message types: "ELECTION", "ACK", "LEADER", "PING", "PONG"
+
+      var message = {type: msgType, sender: selfPid}
+      client.send("/topic/" + receiverPid, {}, JSON.stringify(message));//JSON.stringify(): transform the JSON object to a String and send it
+    }
+	
+    function onMessage(receivedMessage) {	 // called every time the client receives a message
+
+      var msg = JSON.parse(receivedMessage.body);  // JSON.parse(): transform the String to a JSON object  
+
+      if (msg.type == "ELECTION") {
+        print('logs', msg.sender + ' starts a new election. Sending ACK');
+        sendMessage(msg.sender, "ACK");
+			  startElection();
+
+      } else if (msg.type == "LEADER" || msg.type == "PONG") {
+        if (msg.type == "LEADER") {
+			    if (msg.sender < selfPid) {  // catch sync issues TODO: think about it
+				    startElection();
+            return;
+          }
+          gotLeader = true;
+          leaderPid = msg.sender;
+          if (!startedElection) {
+            print('logs', msg.sender + ' is our new LEADER!')
+            clearTimeout(electionTimer);
+            if (leaderPid == selfPid) {  // don't ping me
+              return;
+            }
+            clearTimeout(leaderTimer);
+            leaderTimer = setTimeout(pingLeader, Math.random() * maxPingPongLag + 1);
+          }
+          return;
+        } else {
+          print('received', 'LEADER [<b>' + msg.sender + '</b>] ponged me!')
+        }
+
+        // Leader replied (or a new one has been elected) send a ping in a while
+        clearTimeout(leaderTimer);
+        leaderTimer = setTimeout(pingLeader, maxPingPongLag);
+
+      } else if (msg.type == "ACK") {
+        ackReceived = true;
+
+      } else if (msg.type == "PING") {
+        // I'm the leader, reply a PONG
+        print('received', '[' + msg.sender + '] Pinged me!')
+        sendMessage(msg.sender, "PONG");
+
+      } else {
+        print('logs', 'Wrong message type received: ' + msg.type + '. Disconnecting...');
+        disconnect();
+      }
+    }
+	
+	  function onElectionTimeout() {
+      print('logs', 'Election ended');
+      startedElection = false;
+      if (gotLeader) {
+        print('logs', leaderPid + ' is our new LEADER!')
+        clearTimeout(electionTimer);
+        if (leaderPid == selfPid) {  // don't ping me
+          return;
+        }
+        clearTimeout(leaderTimer);
+        leaderTimer = setTimeout(pingLeader, maxPingPongLag);
+        return;
+      }
+
+      if (Boolean(ackReceived)) {  // If ACKs are received but no LEADER (after a timeout), restart an election
+        print('logs', 'Starting over');
+        startElection();
+        return;
+      }
+      print('logs', 'I\'m the new leader!');
+      leaderPid = selfPid;
+      notifyOthers(0, "LEADER");
+    }
+	
+    function pingLeader() {
+      sendMessage(leaderPid, "PING");
+      leaderTimer = setTimeout(onLeaderTimeout, leaderTimeout);
+    }
+
+    function onLeaderTimeout() {
+  		// if (!disconnected) {  // TODO Check this out
+  			leaderPid = null;
+  			print('logs', 'Leader is dead.');
+  			startElection();
+  		// }
+    }
+	
+    function print(elId, text) { 
+      // Prints text in ellement with id = elId
+      if (elId != null) {
+        var div = document.getElementById(elId);
+        div.innerHTML += "<br/>" + text;
+        div.scrollTop = div.scrollHeight;;
+      }
+    }
+
+    function onError(error) {
+      print('logs', 'error: ' + error);
+      disconnect();			//probably unnecessary
+    }
+
+  	// Check if input PID is a positive integer
+  	function inputCheck(selfPid) {
+  		
+      if (selfPid == "" || isNaN(selfPid) || (selfPid < 0)) {  // It's not a number
+        return false;
+      }
+      return true;
+  	}
+
+  	// Catch Enter button to Connect
+  	function catchReturnKey(event) {
+  		if (event.which == 13 || event.keyCode == 13) {
+  				connect();
+  		}
+  	}
+
+    function disconnect() {
+      client.disconnect(onDisconnect);
+    }
+
+    function onDisconnect() {
+      print('logs', 'Disconnected');
+      clearTimeout(leaderTimer);
+      clearTimeout(electionTimer);
+      document.getElementById('selfPid').disabled = false;
+      document.getElementById('connectButton').disabled = false;
+      document.getElementById('disConnectButton').disabled = true;
+	    disconnected = true;
+	    subscription.unsubscribe();
+
+    }
+	
+  </script>
+</body></html>
